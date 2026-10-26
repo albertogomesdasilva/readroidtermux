@@ -1,14 +1,16 @@
-"""Assistente de IA OPCIONAL do ReaDroid (OpenRouter + opencode).
+"""Assistente de IA OPCIONAL do ReaDroid (OpenRouter+opencode OU Codex).
 
 Regras deste módulo:
 - O núcleo do ReaDroid nunca depende dele: o app.py só o importa quando você abre o menu 13,
   e se este arquivo for apagado o menu 13 simplesmente some.
-- Usa só a biblioteca padrão. A chave de API fica FORA do projeto (~/.readroid), com permissão
-  600, para nunca ir parar num commit do GitHub.
-- O opencode é sempre iniciado dentro de uma pasta de trabalho explícita, com a config e a
-  chave passadas por variável de ambiente. Assim ele não depende de qual pasta você estava
-  quando digitou o comando (era isso que fazia a IA "abrir mas não responder" fora de
-  ~/projetos/opencode-teste).
+- Usa só a biblioteca padrão. A chave do OpenRouter (provedor opencode) fica FORA do projeto
+  (~/.readroid), com permissão 600, para nunca ir parar num commit do GitHub.
+- Dois provedores de IA, escolhidos no menu (opção [P]):
+    * opencode  -> ReaDroid gerencia a chave do OpenRouter e gera o opencode.json sozinho.
+    * codex     -> usa o binário `codex` já configurado globalmente no seu Termux (o ReaDroid
+                   não mexe em chave/modelo do Codex, só chama o binário na pasta certa).
+- Os dois são sempre iniciados dentro de uma pasta de trabalho explícita (nunca na pasta
+  pessoal). Era isso que fazia a IA "abrir mas não responder" fora da pasta certa.
 """
 from __future__ import annotations
 
@@ -38,6 +40,21 @@ PREFERRED_MODELS = (
     "nvidia/nemotron-3-super-120b-a12b:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
 )
+
+PROVIDER_OPENCODE = "opencode"
+PROVIDER_CODEX = "codex"
+PROVIDERS = (PROVIDER_OPENCODE, PROVIDER_CODEX)
+DEFAULT_PROVIDER = PROVIDER_OPENCODE
+
+PROVIDER_LABELS = {
+    PROVIDER_OPENCODE: "opencode (OpenRouter, gerenciado pelo ReaDroid)",
+    PROVIDER_CODEX: "codex (binário global do seu Termux)",
+}
+
+# Comando do Codex em modo automático: roda a tarefa sozinho, editando arquivos sem
+# perguntar de volta. Ajustável em ai.json (chave "codex_exec_args") caso sua versão do
+# codex use flags diferentes — o ReaDroid nunca sobrescreve se você já tiver configurado.
+DEFAULT_CODEX_EXEC_ARGS = ["exec", "--full-auto", "--skip-git-repo-check"]
 
 _CTRL_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _KEY_RE = re.compile(r"^[A-Za-z0-9_\-]{20,200}$")
@@ -84,20 +101,49 @@ def load_key() -> str | None:
     return value or None
 
 
-def load_model() -> str:
+def _load_settings() -> dict[str, Any]:
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-        model = str(data.get("model", "")).strip()
-        if model:
-            return model
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
-        pass
-    return DEFAULT_MODEL
+        return {}
+
+
+def _save_settings(patch: dict[str, Any]) -> None:
+    """Lê o ai.json, aplica só as chaves de patch e regrava (nunca apaga as outras)."""
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    data = _load_settings()
+    data.update(patch)
+    SETTINGS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def load_model() -> str:
+    model = str(_load_settings().get("model", "")).strip()
+    return model or DEFAULT_MODEL
 
 
 def save_model(model: str) -> None:
-    HOME_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps({"model": model}, indent=2) + "\n", encoding="utf-8")
+    _save_settings({"model": model})
+
+
+def load_provider() -> str:
+    provider = str(_load_settings().get("provider", "")).strip()
+    return provider if provider in PROVIDERS else DEFAULT_PROVIDER
+
+
+def save_provider(provider: str) -> None:
+    if provider not in PROVIDERS:
+        raise ValueError(f"Provedor desconhecido: {provider}")
+    _save_settings({"provider": provider})
+
+
+def load_codex_bin() -> str:
+    return str(_load_settings().get("codex_bin", "") or "codex").strip() or "codex"
+
+
+def load_codex_exec_args() -> list[str]:
+    args = _load_settings().get("codex_exec_args")
+    return [str(a) for a in args] if isinstance(args, list) and args else list(DEFAULT_CODEX_EXEC_ARGS)
 
 
 def build_opencode_config(model: str) -> dict[str, Any]:
@@ -157,6 +203,27 @@ def find_opencode() -> str | None:
     return str(candidate) if candidate.is_file() else None
 
 
+def find_codex() -> str | None:
+    """O Codex não é gerenciado pelo ReaDroid: usa o binário já configurado no Termux."""
+    found = shutil.which(load_codex_bin())
+    if found:
+        return found
+    candidate = Path.home() / ".codex" / "bin" / "codex"
+    return str(candidate) if candidate.is_file() else None
+
+
+def codex_command(binary: str, prompt: str | None = None) -> list[str]:
+    """Sem prompt: abre a TUI interativa do Codex. Com prompt: `codex exec` em modo
+    automático (--full-auto) — ele edita os arquivos sozinho, sem perguntar de volta."""
+    if prompt is None:
+        return [binary]
+    return [binary, *load_codex_exec_args(), prompt]
+
+
+def find_provider_binary(provider: str) -> str | None:
+    return find_opencode() if provider == PROVIDER_OPENCODE else find_codex()
+
+
 def safe_workdir(path: Path) -> tuple[bool, str]:
     """Recusa pastas enormes (HOME, raiz). Abrir o opencode na pasta pessoal faz ele
     tratar o Termux inteiro como projeto, e é uma das causas de travar sem responder."""
@@ -183,44 +250,74 @@ def opencode_command(binary: str, model: str, prompt: str | None = None) -> list
     return [binary, "run", "-m", model_ref, prompt]
 
 
+def _ready(provider: str) -> tuple[bool, str, str | None]:
+    """Checa se o provedor está pronto para uso. Devolve (ok, mensagem_de_erro, binário)."""
+    binary = find_provider_binary(provider)
+    if provider == PROVIDER_OPENCODE:
+        if not load_key():
+            return False, "IA não configurada. Use a opção de configurar.", None
+        if not binary:
+            return False, "opencode não encontrado no PATH.", None
+    else:
+        if not binary:
+            return False, ("codex não encontrado no PATH. Confirme que `codex` funciona "
+                           "direto no Termux fora do ReaDroid."), None
+    return True, "", binary
+
+
+def _command_for(provider: str, binary: str, prompt: str | None) -> list[str]:
+    if provider == PROVIDER_OPENCODE:
+        return opencode_command(binary, load_model(), prompt)
+    return codex_command(binary, prompt)
+
+
+def _env_for(provider: str) -> dict[str, str]:
+    if provider == PROVIDER_OPENCODE:
+        key = load_key()
+        return build_env(key) if key else os.environ.copy()
+    # Codex usa a configuração global já existente no Termux: herda o ambiente como está.
+    return os.environ.copy()
+
+
 def open_interactive(workdir: Path) -> dict[str, Any]:
-    key, binary = load_key(), find_opencode()
-    if not key:
-        return {"ok": False, "message": "IA não configurada. Use a opção de configurar."}
-    if not binary:
-        return {"ok": False, "message": "opencode não encontrado no PATH."}
+    provider = load_provider()
+    ready, why, binary = _ready(provider)
+    if not ready:
+        return {"ok": False, "message": why}
     ok, why = safe_workdir(workdir)
     if not ok:
         return {"ok": False, "message": why}
-    model = load_model()
-    write_opencode_config(model)
+    if provider == PROVIDER_OPENCODE:
+        write_opencode_config(load_model())
+    label = PROVIDER_LABELS[provider]
     try:
-        code = subprocess.run(opencode_command(binary, model), cwd=workdir, env=build_env(key),
+        code = subprocess.run(_command_for(provider, binary, None), cwd=workdir, env=_env_for(provider),
                               check=False).returncode
     except OSError as exc:
-        return {"ok": False, "message": f"Não foi possível iniciar o opencode: {exc}"}
-    return {"ok": True, "message": f"opencode encerrado (código {code})."}
+        return {"ok": False, "message": f"Não foi possível iniciar o {provider}: {exc}"}
+    return {"ok": True, "message": f"{label} encerrado (código {code})."}
 
 
 def ask_once(workdir: Path, prompt: str, timeout: int = 300, emit=print) -> dict[str, Any]:
-    """Faz uma pergunta e imprime a resposta linha a linha, já sanitizada."""
-    key, binary = load_key(), find_opencode()
-    if not key:
-        return {"ok": False, "message": "IA não configurada."}
-    if not binary:
-        return {"ok": False, "message": "opencode não encontrado no PATH."}
+    """Faz uma pergunta/tarefa no provedor ativo e imprime a saída linha a linha, já
+    sanitizada. No provedor codex isto roda `codex exec --full-auto`: a IA edita os
+    arquivos sozinha, sem pausar para confirmar cada passo."""
+    provider = load_provider()
+    ready, why, binary = _ready(provider)
+    if not ready:
+        return {"ok": False, "message": why}
     ok, why = safe_workdir(workdir)
     if not ok:
         return {"ok": False, "message": why}
-    model = load_model()
-    write_opencode_config(model)
+    if provider == PROVIDER_OPENCODE:
+        write_opencode_config(load_model())
     import threading
     try:
-        proc = subprocess.Popen(opencode_command(binary, model, prompt), cwd=workdir, env=build_env(key),
+        proc = subprocess.Popen(_command_for(provider, binary, prompt), cwd=workdir, env=_env_for(provider),
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 errors="replace", stdin=subprocess.DEVNULL)
     except OSError as exc:
-        return {"ok": False, "message": f"Não foi possível iniciar o opencode: {exc}"}
+        return {"ok": False, "message": f"Não foi possível iniciar o {provider}: {exc}"}
     timer = threading.Timer(timeout, proc.kill)
     timer.start()
     lines = 0
@@ -229,7 +326,7 @@ def ask_once(workdir: Path, prompt: str, timeout: int = 300, emit=print) -> dict
         assert proc.stdout is not None
         for line in proc.stdout:
             text = _clean(line.rstrip("\n"))
-            if _UNAVAIL_RE.search(text):
+            if provider == PROVIDER_OPENCODE and _UNAVAIL_RE.search(text):
                 unavailable = True
             emit(text)
             lines += 1
@@ -245,7 +342,7 @@ def ask_once(workdir: Path, prompt: str, timeout: int = 300, emit=print) -> dict
     if proc.returncode in (-9, 137):
         return {"ok": False, "message": f"Sem resposta em {timeout}s; processo encerrado."}
     return {"ok": proc.returncode == 0 and lines > 0,
-            "message": "Concluído." if proc.returncode == 0 and lines else "O opencode não devolveu resposta."}
+            "message": "Concluído." if proc.returncode == 0 and lines else f"O {provider} não devolveu resposta."}
 
 
 # ------------------------------------------------------------------ OpenRouter direto (diagnóstico)
@@ -347,9 +444,10 @@ PROMPT_BUILD = ("Esta pasta é um APK decodificado pelo apktool e a reconstruç�
 
 
 def ask_with_fallback(ui, folder: Path, prompt: str) -> dict[str, Any]:
-    """ask_once; se o modelo gratuito saiu do ar, troca por outro :free e tenta uma vez de novo."""
+    """ask_once; se o modelo gratuito saiu do ar (só acontece no opencode), troca por
+    outro :free e tenta uma vez de novo."""
     res = ask_once(folder, prompt, emit=print)
-    if res.get("model_unavailable"):
+    if res.get("model_unavailable") and load_provider() == PROVIDER_OPENCODE:
         key = load_key()
         print(ui.YELLOW + "Modelo gratuito indisponível. Procurando outro…" + ui.RESET)
         found = ensure_working_model(key, (load_model(),)) if key else None
@@ -407,12 +505,33 @@ def _setup(ui) -> bool:
     return _run_checks(ui)
 
 
+def _run_checks_codex(ui) -> bool:
+    print(ui.CYAN + "\nTestando (codex)…" + ui.RESET)
+    binary = find_codex()
+    print(f" [{ui.GREEN + 'OK' + ui.RESET if binary else ui.RED + 'falhou' + ui.RESET}] "
+          f"codex: {binary or 'não encontrado no PATH'}")
+    if not binary:
+        return False
+    print(ui.DIM + " Testando `codex exec` numa pasta neutra (até 2 min)… "
+          "se sua versão usa outras flags, ajuste em ~/.readroid/ai.json (\"codex_exec_args\")." + ui.RESET)
+    WORKSPACE.mkdir(parents=True, exist_ok=True)
+    out: list[str] = []
+    res = ask_once(WORKSPACE, "Responda apenas: OK. Não edite nenhum arquivo.", timeout=120, emit=out.append)
+    print(f" [{ui.GREEN + 'OK' + ui.RESET if res['ok'] else ui.RED + 'falhou' + ui.RESET}] "
+          f"codex exec: {res['message']}")
+    if out:
+        print(ui.DIM + "   " + " | ".join(out)[-160:] + ui.RESET)
+    return bool(res["ok"])
+
+
 def _run_checks(ui) -> bool:
+    if load_provider() == PROVIDER_CODEX:
+        return _run_checks_codex(ui)
     key, model = load_key(), load_model()
     if not key:
         print(ui.YELLOW + "Sem chave configurada." + ui.RESET)
         return False
-    print(ui.CYAN + "\nTestando…" + ui.RESET)
+    print(ui.CYAN + "\nTestando (opencode)…" + ui.RESET)
     api = test_api(key, model)
     if not api["ok"] and api.get("model_unavailable"):
         print(ui.YELLOW + f" Modelo {model} indisponível. Procurando outro gratuito…" + ui.RESET)
@@ -468,6 +587,16 @@ PROMPT_CROSS = ("Abaixo está o resultado da análise estática do ReaDroid para
 EDIT_RULES = ("Regras: edite SOMENTE arquivos dentro desta pasta; não altere apktool.yml; faça a menor "
               "mudança possível; não rode comandos de build (o ReaDroid reconstrói depois); ao final, liste "
               "os arquivos que alterou.\n\n")
+RECREATE_RULES = ("Regras: trabalhe SOMENTE dentro desta pasta (saída do apktool/jadx); não altere "
+                   "apktool.yml; não rode comandos de build (o ReaDroid reconstrói depois); faça as "
+                   "mudanças em etapas pequenas e coerentes, sem quebrar o resto do app; ao final, liste "
+                   "os arquivos que criou ou alterou e um resumo do que foi recriado.\n\n")
+PROMPT_RECREATE = ("Esta pasta é um app Android decodificado (apktool/jadx). Primeiro leia o "
+                    "AndroidManifest.xml e entenda a estrutura geral. Depois, recrie/reescreva a parte "
+                    "pedida abaixo com código limpo e moderno, preservando o comportamento observável "
+                    "(mesmas telas, mesmo fluxo, mesmos nomes de recursos usados pelo manifesto), a menos "
+                    "que a instrução peça explicitamente para mudar o comportamento. Use só em um app seu "
+                    "ou que você tem autorização para modificar.\n\nO QUE RECRIAR:\n")
 
 
 def _shrink(obj: Any, max_items: int = 40, max_str: int = 200) -> Any:
@@ -538,11 +667,13 @@ def build_error_text(result: dict[str, Any]) -> str:
 
 
 def fix_loop(decoded: Path, instruction: str, build_fn, ask_fn, confirm_fn, say,
-             max_rounds: int = MAX_ROUNDS) -> dict[str, Any]:
+             max_rounds: int = MAX_ROUNDS, rules: str = EDIT_RULES) -> dict[str, Any]:
     """Ciclo: (IA edita) -> reconstrói -> se falhar, devolve o erro à IA -> reconstrói de novo.
 
     build_fn() -> resultado do build_pipeline; ask_fn(prompt) -> {"ok":..,"message":..};
-    confirm_fn(texto) -> bool; say(texto) imprime. Tudo injetado para ser testável."""
+    confirm_fn(texto) -> bool; say(texto) imprime; rules -> cabeçalho de regras prefixado em
+    cada chamada (EDIT_RULES para edição pontual, RECREATE_RULES para recriação). Tudo
+    injetado para ser testável."""
     def report_changes(before):
         d = diff_snapshots(before, snapshot(decoded))
         n = sum(len(v) for v in d.values())
@@ -553,7 +684,7 @@ def fix_loop(decoded: Path, instruction: str, build_fn, ask_fn, confirm_fn, say,
 
     if instruction:
         before = snapshot(decoded)
-        res = ask_fn(EDIT_RULES + f"Pasta: {decoded}\nTarefa: {instruction}")
+        res = ask_fn(rules + f"Pasta: {decoded}\nTarefa: {instruction}")
         if not res.get("ok"):
             return {"ok": False, "rounds": 0, "message": res.get("message", "A IA não respondeu.")}
         report_changes(before)
@@ -568,7 +699,7 @@ def fix_loop(decoded: Path, instruction: str, build_fn, ask_fn, confirm_fn, say,
         if rnd == max_rounds or not confirm_fn("Pedir para a IA corrigir e tentar de novo?"):
             break
         before = snapshot(decoded)
-        res = ask_fn(EDIT_RULES + f"Pasta: {decoded}\nA reconstrução falhou com este erro. Corrija a causa:\n{error}")
+        res = ask_fn(rules + f"Pasta: {decoded}\nA reconstrução falhou com este erro. Corrija a causa:\n{error}")
         if not res.get("ok"):
             return {"ok": False, "rounds": rnd, "result": last, "message": res.get("message", "A IA não respondeu.")}
         report_changes(before)
@@ -631,33 +762,120 @@ def _edit_and_rebuild(ui, decoded: Path) -> None:
             print(f"Para desfazer as mudanças da IA, restaure o backup: {backup}")
 
 
+def _recreate_with_ai(ui, decoded: Path) -> None:
+    """Recria/reescreve uma parte do app do zero (ou o app inteiro, módulo por módulo).
+    Reaproveita o mesmo ciclo editar -> reconstruir -> corrigir do _edit_and_rebuild, só que
+    com um prompt de recriação em vez de edição pontual. Pensado para o provedor codex
+    (modo automático, várias etapas sozinho), mas funciona com qualquer provedor ativo."""
+    from . import builder
+    from datetime import datetime
+    if not (decoded / "apktool.yml").is_file():
+        print(ui.YELLOW + "Essa pasta não é uma saída do Apktool (opção 5 do menu principal)." + ui.RESET)
+        return
+    provider = load_provider()
+    print(ui.YELLOW + "Recriação de código é uma mudança grande. Use só em APK seu ou autorizado." + ui.RESET)
+    print(ui.DIM + f"Provedor ativo: {PROVIDER_LABELS[provider]}" + ui.RESET)
+    target = ui.safe_input(
+        "O que recriar? (ex.: 'a tela de login', 'o parser de XML', "
+        "'tudo, modernizando o código') : "
+    ).strip()
+    if not target:
+        print(ui.YELLOW + "Nada informado." + ui.RESET)
+        return
+    print(f"A IA vai reescrever arquivos em {decoded}. Será feito um backup antes.")
+    if ui.safe_input("Continuar? (s/N): ").strip().lower() != "s":
+        return
+    backup = _backup(ui, decoded)
+    if backup is None:
+        print(ui.YELLOW + "Não consegui criar o backup (espaço?)." + ui.RESET)
+        if ui.safe_input("Continuar sem backup? (s/N): ").strip().lower() != "s":
+            return
+    else:
+        print(ui.GREEN + f"Backup: {backup}" + ui.RESET)
+
+    def build_fn():
+        name = decoded.name.replace("_apktool", "") or "app"
+        work = ui.BUILDS / f"{name}_{datetime.now():%Y%m%d_%H%M%S}"
+        result = builder.build_pipeline(decoded, work, ui.KEYSTORE, builder.DEFAULT_ALIAS,
+                                        builder.DEFAULT_STOREPASS, [], lambda m: print(ui.CYAN + " · " + m + ui.RESET))
+        _print_build(ui, result)
+        return result
+
+    instruction = PROMPT_RECREATE + target
+    out = fix_loop(decoded, instruction, build_fn, lambda prompt: ask_with_fallback(ui, decoded, prompt),
+                   lambda q: ui.safe_input(q + " (s/N): ").strip().lower() == "s", print,
+                   rules=RECREATE_RULES)
+    if out["ok"]:
+        print(ui.GREEN + f"\nAPK recriado e reconstruído: {out['result'].get('final_apk')}" + ui.RESET)
+    else:
+        print(ui.RED + "\n" + out["message"] + ui.RESET)
+        if backup:
+            print(f"Para desfazer as mudanças da IA, restaure o backup: {backup}")
+
+
+def _choose_provider(ui) -> None:
+    current = load_provider()
+    print(ui.CYAN + "\nProvedores disponíveis:" + ui.RESET)
+    for i, prov in enumerate(PROVIDERS, 1):
+        mark = " (atual)" if prov == current else ""
+        print(f" [{i}] {PROVIDER_LABELS[prov]}{mark}")
+    raw = ui.safe_input("Escolha o provedor (ENTER para cancelar): ").strip()
+    if not raw:
+        return
+    try:
+        chosen = PROVIDERS[int(raw) - 1]
+    except (ValueError, IndexError):
+        print(ui.YELLOW + "Opção inválida." + ui.RESET)
+        return
+    save_provider(chosen)
+    print(ui.GREEN + f"Provedor ativo: {PROVIDER_LABELS[chosen]}" + ui.RESET)
+    if chosen == PROVIDER_CODEX and not find_codex():
+        print(ui.YELLOW + "Aviso: não achei o binário `codex` no PATH agora. Confirme que ele "
+              "funciona direto no Termux (fora do ReaDroid) antes de usar." + ui.RESET)
+    if chosen == PROVIDER_OPENCODE and load_key() is None:
+        print(ui.YELLOW + "Aviso: o provedor opencode precisa de uma chave do OpenRouter "
+              "(opção [10] Trocar a chave)." + ui.RESET)
+
+
 def run_menu(ui) -> None:
     """Menu 13. `ui` é o módulo app (cores, safe_input, sanitize, OUTPUTS, REPORTS, BUILDS, KEYSTORE)."""
     print(ui.CYAN + "\nASSISTENTE DE IA (opcional)" + ui.RESET)
     print(ui.DIM + "O ReaDroid funciona normalmente sem isto. Ignore se não quiser usar IA." + ui.RESET)
-    if load_key() is None:
-        print("Nenhuma chave configurada ainda.")
-        if ui.safe_input("Configurar agora? Basta colar a API key do OpenRouter (s/N): ").strip().lower() == "s":
+    if load_provider() == PROVIDER_OPENCODE and load_key() is None:
+        print("Nenhuma chave configurada ainda para o opencode.")
+        print(ui.DIM + "Se você usa o Codex (já configurado no Termux), escolha [P] no menu abaixo." + ui.RESET)
+        if ui.safe_input("Configurar o opencode agora? Basta colar a API key do OpenRouter (s/N): ").strip().lower() == "s":
             _setup(ui)
-        return
+    _menu_loop(ui)
+
+
+def _menu_loop(ui) -> None:
     consented = False
     while True:
-        print(f"\n Modelo: openrouter/{load_model()}")
+        provider = load_provider()
+        status = f"openrouter/{load_model()}" if provider == PROVIDER_OPENCODE else "binário global do Termux"
+        print(f"\n Provedor: {PROVIDER_LABELS[provider]}  ({status})")
         print(" [1] Abrir o assistente numa pasta de APK (interativo)")
         print(" [2] Resumir o app")
         print(" [3] Cruzar relatórios do ReaDroid com o código")
         print(" [4] Editar com a IA e reconstruir (corrige erros em ciclo)")
-        print(" [5] Explicar um erro de reconstrução")
-        print(" [6] Pergunta livre sobre o APK")
-        print(" [7] Testar / diagnosticar")
-        print(" [8] Trocar modelo")
-        print(" [9] Trocar a chave")
-        print(" [10] Desativar IA (apaga chave e config)")
+        print(" [5] Recriar um trecho do app do zero (automático, ciclo completo)")
+        print(" [6] Explicar um erro de reconstrução")
+        print(" [7] Pergunta livre sobre o APK")
+        print(" [8] Testar / diagnosticar")
+        print(" [9] Trocar modelo (só opencode)")
+        print(" [10] Trocar a chave (só opencode)")
+        print(" [P] Trocar provedor de IA (opencode/codex)")
+        print(" [11] Desativar IA (apaga chave e config)")
         print(" [0] Voltar")
         choice = ui.safe_input("IA > ").strip()
         if choice in ("", "0"):
             return
-        if choice in ("1", "2", "3", "4", "5", "6"):
+        low = choice.lower()
+        if low == "p":
+            _choose_provider(ui)
+            continue
+        if choice in ("1", "2", "3", "4", "5", "6", "7"):
             if not consented:
                 print(ui.YELLOW + PRIVACY + ui.RESET)
                 if ui.safe_input("Continuar? (s/N): ").strip().lower() != "s":
@@ -681,6 +899,8 @@ def run_menu(ui) -> None:
             elif choice == "4":
                 _edit_and_rebuild(ui, folder)
             elif choice == "5":
+                _recreate_with_ai(ui, folder)
+            elif choice == "6":
                 err = ui.safe_input("Cole o erro (uma linha) ou ENTER para cancelar: ").strip()
                 if not err:
                     continue
@@ -692,14 +912,14 @@ def run_menu(ui) -> None:
                 res = ask_with_fallback(ui, folder, question[:4000])
             if res is not None:
                 print((ui.GREEN if res["ok"] else ui.YELLOW) + res["message"] + ui.RESET)
-        elif choice == "7":
-            _run_checks(ui)
         elif choice == "8":
-            _change_model(ui)
+            _run_checks(ui)
         elif choice == "9":
-            _setup(ui)
+            _change_model(ui)
         elif choice == "10":
-            if ui.safe_input("Apagar chave e configuração da IA? (s/N): ").strip().lower() == "s":
+            _setup(ui)
+        elif choice == "11":
+            if ui.safe_input("Apagar chave e configuração da IA (opencode e codex)? (s/N): ").strip().lower() == "s":
                 gone = disable()
                 print(ui.GREEN + ("Removido: " + ", ".join(gone) if gone else "Nada para remover.") + ui.RESET)
                 return
